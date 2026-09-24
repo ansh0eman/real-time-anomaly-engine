@@ -1,3 +1,15 @@
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
 # Ignore all markdown files
 *.md
 
