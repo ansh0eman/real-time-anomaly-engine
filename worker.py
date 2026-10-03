@@ -4,10 +4,10 @@ import asyncio
 from redis.asyncio import Redis
 from redis.asyncio.connection import ConnectionPool
 import database
-from sklearn.ensemble import IsolationForest
 import numpy as np
 import httpx
 from datetime import datetime
+from detector import detect, fit_detector
 
 API_URL = os.getenv("API_URL", "http://web_api:8000")
 
@@ -18,24 +18,11 @@ async def train_model_or_fallback(pool):
             "SELECT request_volume, error_rate, latency_ms FROM streamed_metrics ORDER BY timestamp DESC LIMIT 50000"
         )
     
-    if len(records) > 1000:
-        data = np.array([[float(r['request_volume']), float(r['error_rate']), float(r['latency_ms'])] for r in records], dtype=np.float64)
-        # n_estimators=100 and contamination=0.01 as required
-        model = IsolationForest(contamination=0.01, n_estimators=100, random_state=42)
-        model.fit(data)
-        return model, None
-    else:
-        # Fallback to rolling statistical calculation (Z-Score)
-        if len(records) > 0:
-            data = np.array([[float(r['request_volume']), float(r['error_rate']), float(r['latency_ms'])] for r in records], dtype=np.float64)
-            mean = np.mean(data, axis=0)
-            std = np.std(data, axis=0)
-            # Avoid division by zero
-            std[std == 0] = 1.0
-            return None, (mean, std)
-        else:
-            # No data at all, provide a dummy stat
-            return None, (np.zeros(3), np.ones(3))
+    rows = [
+        [float(r['request_volume']), float(r['error_rate']), float(r['latency_ms'])]
+        for r in records
+    ]
+    return fit_detector(rows)
 
 async def process_stream():
     await database.create_pool()
@@ -100,29 +87,10 @@ async def process_stream():
                         
                         features = np.array([metrics['request_volume'], metrics['error_rate'], metrics['latency_ms']])
                         
-                        is_anomaly = False
-                        anomaly_score = 0.0
-                        flagged_features = []
-                        
-                        if model is not None:
-                            pred = model.predict([features])
-                            score = model.score_samples([features])[0]
-                            anomaly_score = float(score)
-                            is_anomaly = pred[0] == -1
-                            if is_anomaly:
-                                # Isolation forest doesn't give specific features easily, 
-                                # we could just flag 'all' or do additional logic. 
-                                # For now, we flag the whole metric set.
-                                flagged_features = ['request_volume', 'error_rate', 'latency_ms']
-                        else:
-                            # Z-Score fallback
-                            mean, std = stats
-                            z_scores = (features - mean) / std
-                            if np.any(np.abs(z_scores) > 3):
-                                is_anomaly = True
-                                anomaly_score = min(float(np.max(np.abs(z_scores))), 9.9999)
-                                feature_names = ['request_volume', 'error_rate', 'latency_ms']
-                                flagged_features = [feature_names[i] for i, z in enumerate(z_scores) if abs(z) > 3]
+                        detection = detect(features, model=model, stats=stats)
+                        is_anomaly = detection.is_anomaly
+                        anomaly_score = detection.score
+                        flagged_features = detection.flagged_features
                         
                         # Use raw SQL queries utilizing asyncpg
                         async with pool.acquire() as conn:
